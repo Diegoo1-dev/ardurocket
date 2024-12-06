@@ -1,0 +1,414 @@
+#include <SoftwareSerial.h> 
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_BMP085.h>
+#include <TinyGPS++.h>
+
+// Definir pines para SoftwareSerial (HC-12)
+#define HC12_RX_PIN 5 // Pin 5 como RX para HC-12
+#define HC12_TX_PIN 4 // Pin 4 como TX para HC-12
+
+// Inicializar SoftwareSerial para HC-12
+SoftwareSerial hc12_serial(HC12_RX_PIN, HC12_TX_PIN); // RX, TX
+
+// Inicializar GPS
+TinyGPSPlus gps;
+
+// Inicializar Servo
+Servo servo_6;
+
+// Inicializar BMP180
+Adafruit_BMP085 bmp180;
+
+// Variables para GPS
+double gps_lat = 0;
+double gps_long = 0;
+double gps_speed_kmph = 0;
+double gps_altitude = 0;
+double gps_course = 0;
+bool gps_fixed = false;
+byte gps_day = 0;
+byte gps_month = 0;
+int gps_year = 0;
+byte gps_hour = 0;
+byte gps_min = 0;
+byte gps_sec = 0;
+int gps_satellites = 0;
+
+double tiempos;
+
+// Variable para controlar si ya se ha enviado el número de satélites
+bool satelites_enviados = false;
+
+unsigned long lastRawDataTime = 0;
+
+// Variables para la lógica de vuelo
+bool passed_100m_ascent = false;
+bool descending = false;
+bool servo_deployed = false;
+bool servo_returned = false;
+unsigned long servo_deploy_time = 0;
+float previous_altitude = 0.0;
+
+unsigned long flightStartTime = 0;
+
+// Variables para detección de aterrizaje
+bool landed = false;
+unsigned long landingStartTime = 0;
+float vertical_speed = 0.0;
+unsigned long lastAltitudeTime = 0;
+
+// Variable para almacenar la altitud de despegue
+float launch_altitude = 0.0;
+
+// Variables para la detección de despegue basada en cambio de altitud
+bool speed_exceeded = false;
+unsigned long speed_exceed_time = 0;
+
+// Función para obtener la altitud más confiable
+float obtenerAltitudConfiable() {
+  float altitud_barometro = bmp180.readAltitude() + 21.3; // Añadido offset de 21.3 m
+  float altitud_gps = gps_altitude;
+
+  // Si la altitud del GPS es válida
+  if (gps.altitude.isValid()) {
+    // Si la diferencia entre las altitudes es menor a 10 metros
+    if (abs(altitud_barometro - altitud_gps) <= 10.0) {
+      // Ambas altitudes parecen razonables, usar altitud del barómetro
+      return altitud_barometro;
+    } else {
+      // La diferencia es grande, posiblemente el GPS no es preciso
+      return altitud_barometro;
+    }
+  } else {
+    // La altitud del GPS no es válida, usar altitud del barómetro
+    return altitud_barometro;
+  }
+}
+
+// Función para actualizar los datos del GPS
+void fnc_gps_update() {
+  // Leer datos del GPS desde el puerto serial
+  while (Serial.available() > 0) {
+    gps.encode(Serial.read());
+  }
+
+  // Obtener el número de satélites disponibles
+  gps_satellites = gps.satellites.value();
+
+  // Actualizar latitud y longitud si están disponibles
+  if (gps.location.isValid()) {
+    gps_fixed = true;
+    gps_lat = gps.location.lat();
+    gps_long = gps.location.lng();
+  } else {
+    gps_fixed = false;
+  }
+
+  // Actualizar la altitud si está disponible
+  if (gps.altitude.isValid()) {
+    gps_altitude = gps.altitude.meters();
+  }
+
+  // Actualizar el rumbo si está disponible
+  if (gps.course.isValid()) {
+    gps_course = gps.course.deg();
+  }
+
+  // Actualizar la velocidad si está disponible
+  if (gps.speed.isValid()) {
+    gps_speed_kmph = gps.speed.kmph();
+  }
+
+  // Actualizar la fecha si está disponible
+  if (gps.date.isValid()) {
+    gps_day = gps.date.day();
+    gps_month = gps.date.month();
+    gps_year = gps.date.year();
+  }
+
+  // Actualizar la hora si está disponible
+  if (gps.time.isValid()) {
+    gps_hour = gps.time.hour();
+    gps_min = gps.time.minute();
+    gps_sec = gps.time.second();
+  }
+}
+
+void setup() {
+  // Inicializar comunicaciones seriales
+  Serial.begin(9600); // Serial para el GPS
+  hc12_serial.begin(9600); // Serial para HC-12
+
+  // Inicializar BMP180 (barómetro)
+  if (!bmp180.begin()) {
+    // Imprimir mensaje de error si el barómetro no se inicializa correctamente
+    hc12_serial.println("ERROR_BAROMETRO: No se pudo inicializar el barómetro.");
+  }
+
+  // Mensaje de inicio del sistema
+  hc12_serial.println("Sistema inicializado y en funcionamiento.");
+
+  // Mensaje de espera de conexión al GPS
+  hc12_serial.println("Esperando conexión GPS...");
+
+  // Leer altitud inicial del barómetro
+  previous_altitude = 0.0; // Iniciar en 0, ya que usaremos altitud relativa
+  lastAltitudeTime = millis();
+}
+
+// Función para esperar un número entre 1 y 100 ingresado por el usuario
+int esperarNumeroEntre1y100() {
+  while (true) {
+    // Limpiar el buffer serial
+    while (hc12_serial.available() > 0) {
+      hc12_serial.read();
+    }
+
+    // Esperar por entrada del usuario
+    while (hc12_serial.available() == 0);
+
+    // Leer la entrada como una cadena
+    String inputStr = hc12_serial.readStringUntil('\n');
+    inputStr.trim();
+
+    // Convertir la cadena a un número entero
+    int input = inputStr.toInt();
+
+    // Imprimir el número recibido
+    hc12_serial.print("Recibido: ");
+    hc12_serial.println(input);
+
+    // Verificar si el número está en el rango válido
+    if (input >= 1 && input <= 100) {
+      return input;
+    } else {
+      // Mensaje de error si el número no está en el rango esperado
+      hc12_serial.println("Entrada incorrecta. Esperando un número entre 1 y 100.");
+    }
+  }
+}
+
+void loop() {
+  // Actualizar los datos del GPS
+  fnc_gps_update();
+
+  // Enviar datos en crudo del GPS cada 5 segundos si no hay conexión GPS
+  if (!gps_fixed && millis() - lastRawDataTime > 5000) {
+    lastRawDataTime = millis();
+    hc12_serial.println("Datos en crudo del GPS:");
+    for (int i = 0; i < 4; i++) {
+      if (Serial.available() > 0) {
+        String raw_data = Serial.readStringUntil('\n');
+        hc12_serial.println(raw_data); // Imprimir datos en crudo del GPS
+      }
+    }
+  }
+
+  // Si se ha obtenido una conexión GPS válida
+  if (gps_fixed) {
+    hc12_serial.println("Conectar");
+    delay(1000);
+    hc12_serial.println("Continuar?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("¿Hacer prueba del sistema de recuperación?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("Comenzando prueba");
+
+    // Adjuntar el servo al pin 6 justo antes de la prueba
+    servo_6.attach(6);
+
+    // Mover el servo 60º en sentido horario y luego volver a la posición original
+    servo_6.write(60); // Mover el servo a 60 grados
+    delay(1000); // Esperar 1 segundo
+    servo_6.write(0); // Volver el servo a la posición original
+    delay(1000); // Esperar 1 segundo
+
+    // Desadjuntar el servo después de la prueba para ahorrar energía
+    servo_6.detach();
+
+    hc12_serial.println("Prueba concluida");
+    delay(1000);
+
+    hc12_serial.println("¿Realizar prueba del GPS?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("Iniciando prueba del GPS...");
+    delay(500);
+    hc12_serial.println("GPS iniciado correctamente");
+
+    // Verificar si los datos del GPS son válidos
+    if (gps_fixed) {
+      hc12_serial.println("Datos del GPS aparentemente SI válidos");
+      delay(3000);
+    } else {
+      hc12_serial.println("Datos del GPS aparentemente NO válidos");
+      delay(3000);
+    }
+
+    // Enviar el número de satélites solo una vez
+    if (!satelites_enviados) {
+      hc12_serial.println("Número de satélites: " + String(gps_satellites));
+      satelites_enviados = true;
+    }
+
+    // Mostrar datos del GPS
+    hc12_serial.println("Velocidad: " + String(gps_speed_kmph) + " km/h");
+    delay(1000);
+    hc12_serial.println("Fecha: " + String(gps_day) + "/" + String(gps_month) + "/" + String(gps_year));
+    delay(1000);
+    hc12_serial.println("Altitud GPS: " + String(gps_altitude) + " m");
+    delay(1000);
+    hc12_serial.println("Altitud Barómetro: " + String(bmp180.readAltitude() + 21.3) + " m");
+    delay(1000);
+    hc12_serial.println("Latitud: " + String(gps_lat));
+    delay(1000);
+    hc12_serial.println("Longitud: " + String(gps_long));
+    delay(1000);
+
+    hc12_serial.println("¿Son estos datos válidos?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("¿Hacer prueba del barómetro?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("Haciendo prueba del barómetro...");
+    delay(1000);
+    hc12_serial.println("Altitud barométrica: " + String(bmp180.readAltitude() + 21.3) + " m"); // Mostrar la altitud leída del barómetro con offset
+    delay(1000);
+    hc12_serial.println("¿Son estos datos válidos?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("¿Proceder al lanzamiento?");
+
+    // Esperar confirmación del usuario
+    esperarNumeroEntre1y100();
+
+    hc12_serial.println("Iniciando cuenta atrás de 1 minuto");
+    tiempos = 60;
+
+    // Cuenta regresiva de 1 minuto
+    while (tiempos > 1) {
+      tiempos = tiempos - 1;
+      hc12_serial.println("T- " + String(tiempos)); // Mostrar el tiempo restante
+      delay(1000);
+    }
+
+    hc12_serial.println("Engine on"); // Mensaje indicando que el motor está encendido
+    tiempos = 0;
+
+    // Marcar el inicio del vuelo
+    flightStartTime = millis();
+
+    // Registrar la altitud de lanzamiento
+    launch_altitude = obtenerAltitudConfiable();
+
+    // Enviar datos del vuelo cada 250 ms durante todo el vuelo
+    while (!landed) {
+      tiempos = (millis() - flightStartTime) / 1000.0; // Calcular el tiempo desde el inicio del vuelo en segundos
+      fnc_gps_update(); // Actualizar datos GPS durante el vuelo
+
+      // Obtener la altitud relativa al lugar de despegue
+      float current_altitude = obtenerAltitudConfiable() - launch_altitude;
+
+      // Calcular la velocidad vertical
+      unsigned long currentTime = millis();
+      float deltaTime = (currentTime - lastAltitudeTime) / 1000.0; // En segundos
+      vertical_speed = (current_altitude - previous_altitude) / deltaTime; // m/s
+      lastAltitudeTime = currentTime;
+
+      // Comprobar si la altitud ha variado más de 3 metros
+      if (!speed_exceeded && abs(current_altitude) > 3.0) {
+        speed_exceeded = true;
+        speed_exceed_time = millis();
+      }
+
+      // Accionar el servo 7 segundos después de detectar el despegue
+      if (speed_exceeded && !servo_deployed) {
+        if (millis() - speed_exceed_time >= 7000) {
+          // Adjuntar el servo si no está adjuntado
+          servo_6.attach(6);
+
+          // Mover el servo 50º en sentido horario
+          servo_6.write(50);
+
+          // Registrar el tiempo en que se desplegó el servo
+          servo_deploy_time = millis();
+
+          servo_deployed = true;
+        }
+      }
+
+      // Después de 1 segundo, regresar el servo a la posición inicial
+      if (servo_deployed && !servo_returned) {
+        if (millis() - servo_deploy_time >= 1000) {
+          // Volver el servo a la posición original
+          servo_6.write(0);
+
+          // Desadjuntar el servo para ahorrar energía
+          servo_6.detach();
+
+          servo_returned = true;
+        }
+      }
+
+      // Detección de aterrizaje
+      if (!landed) {
+        if (current_altitude <= 5.0 && abs(vertical_speed) < 0.1) { // Altitud baja y velocidad vertical cercana a cero
+          if (landingStartTime == 0) {
+            landingStartTime = millis();
+          } else if (millis() - landingStartTime >= 5000) { // Si ha estado en estas condiciones por 5 segundos
+            landed = true;
+            hc12_serial.println("Cohete ha aterrizado.");
+          }
+        } else {
+          landingStartTime = 0; // Resetear el contador si no se cumplen las condiciones
+        }
+      }
+
+      // Guardar la altitud actual para la siguiente iteración
+      previous_altitude = current_altitude;
+
+      // Enviar información del GPS y del barómetro cada 250 ms
+      // Enviar cada línea con 10 ms entre ellas
+      hc12_serial.println("Segundos Arduino: " + String(tiempos));
+      delay(10);
+      hc12_serial.println("Latitud: " + String(gps_lat, 6));
+      delay(10);
+      hc12_serial.println("Altitud GPS: " + String(gps_altitude, 2) + " m");
+      delay(10);
+      hc12_serial.println("Longitud: " + String(gps_long, 6));
+      delay(10);
+      hc12_serial.println("Hora: " + String(gps_hour));
+      delay(10);
+      hc12_serial.println("Minutos: " + String(gps_min));
+      delay(10);
+      hc12_serial.println("Segundos: " + String(gps_sec));
+      delay(10);
+      hc12_serial.println("Altitud Barómetro: " + String(obtenerAltitudConfiable(), 2) + " m");
+      delay(10);
+
+      // Ajustar el tiempo para mantener el intervalo de 250 ms entre cada conjunto de datos
+      unsigned long loopTime = millis() - currentTime;
+      if (loopTime < 250) {
+        delay(250 - loopTime);
+      }
+    }
+
+    hc12_serial.println("Fin del vuelo. Datos de vuelo completos enviados.");
+  }
+}
